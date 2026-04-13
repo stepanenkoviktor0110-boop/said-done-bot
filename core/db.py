@@ -22,9 +22,11 @@ CREATE TABLE IF NOT EXISTS voice_requests (
   user_id INTEGER NOT NULL REFERENCES users(id),
   telegram_file_id TEXT NOT NULL,
   duration_seconds INTEGER,
+  transcript TEXT,
   task_count INTEGER,
   transcript_length INTEGER,
   action_type TEXT,
+  llm_output TEXT,
   summary_length INTEGER,
   audio_path TEXT,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP

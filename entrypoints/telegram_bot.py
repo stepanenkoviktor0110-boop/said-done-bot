@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.transcriber import transcribe_ogg
-from core.task_extractor import extract_tasks
+from core import task_extractor as task_extractor_mod
 from core import db as bot_db
 from core import db_ops
 from core import messages
@@ -53,6 +53,12 @@ logger = logging.getLogger(__name__)
 router = Router()
 _voice_transcripts: dict[str, dict] = {}
 _user_state: dict[int, dict] = {}  # user_id → session state
+_bot_instance: Bot | None = None  # stored for expire timer
+
+# Multi-voice debounce: chat_id → {voices: [{file_id, duration, msg}], timer, reply_ctx}
+_voice_buffers: dict[int, dict] = {}
+MAX_BATCH = 5
+DEBOUNCE_SECS = 3
 
 # Summary LLM (kept separate from task extraction)
 SUMMARY_PROMPT = (
@@ -112,6 +118,8 @@ def _clear_feedback_state(sess: dict):
     sess["awaiting_consent"] = False
     sess["pending_rating"] = None
     sess["pending_comment"] = None
+    sess["action_msg_id"] = None
+    sess["action_chat_id"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +150,109 @@ async def non_voice_handler(msg: Message, next_handler):
 
 
 # ---------------------------------------------------------------------------
-# Voice handler
+# Voice handler — debounce buffer for multi-voice
 # ---------------------------------------------------------------------------
+
+
+async def _process_voice_buffer(chat_id: int, uid: int, bot):
+    """Transcribe all buffered voices, show combined result with progress."""
+    buf = _voice_buffers.pop(chat_id, None)
+    if not buf:
+        return
+
+    voices = buf["voices"][:MAX_BATCH]
+    total = len(buf["voices"])
+    exceeded = total > MAX_BATCH
+
+    # Show processing status
+    if total == 1:
+        wait = await bot.send_message(chat_id=chat_id, text=messages.PROCESSING)
+    else:
+        wait = await bot.send_message(chat_id=chat_id, text=f"🔄 Обрабатываю {total} голосовых...")
+
+    transcripts = []
+    failed = 0
+
+    for i, v in enumerate(voices, 1):
+        # Show progress by COUNT — honest and predictable
+        if total > 1:
+            pct_before = int((i - 1) / total * 100)
+            bar = "█" * (pct_before // 5) + "░" * (20 - pct_before // 5)
+            try:
+                await wait.edit_text(f"🎙 Транскрибация: {i}/{total} ({pct_before}%)\n[{bar}]")
+            except Exception:
+                pass
+        try:
+            file = await bot.get_file(v["file_id"])
+            ogg_bytes = await bot.download_file(file.file_path)
+            text = await transcribe_ogg(ogg_bytes.read())
+            if text:
+                transcripts.append(text)
+            else:
+                failed += 1
+        except Exception as exc:
+            logger.error("Voice transcription failed: %s", exc)
+            failed += 1
+
+    # Final: 100%
+    if total > 1:
+        bar = "█" * 20
+        try:
+            await wait.edit_text(f"🎙 Готово! {total}/{total} (100%)\n[{bar}]")
+        except Exception:
+            pass
+
+    await wait.delete()
+
+    if not transcripts:
+        await bot.send_message(chat_id=chat_id, text=messages.ALL_FAILED)
+        return
+
+    # Merge transcripts via LLM when multiple voices
+    if len(transcripts) > 1:
+        try:
+            combined = await task_extractor_mod.merge_transcripts(transcripts, OR_API_KEY, OR_MODEL)
+        except Exception as exc:
+            logger.error("LLM merge failed: %s", exc)
+            combined = " ".join(transcripts)  # fallback: simple join
+    else:
+        combined = transcripts[0]
+
+    # Build UI notes
+    ui_notes = ""
+    if exceeded:
+        ui_notes += messages.BATCH_LIMIT
+    if failed:
+        ui_notes += messages.failure_note(failed, total)
+    if any(v.get("is_long") for v in voices):
+        ui_notes += "\n\n" + messages.LONG_VOICE
+    if len(combined) > 4000:
+        ui_notes += messages.TRUNCATED_NOTE
+        combined = combined[:4000]
+    if total > 1:
+        ui_notes += "\n\n" + messages.MERGED_NOTE
+
+    logger.info("Multi-voice batch: chatId=%s, total=%d, processed=%d, failed=%d",
+                chat_id, total, len(transcripts), failed)
+
+    await _show_transcript_and_actions(chat_id, uid, combined, bot, ui_notes=ui_notes,
+                                       voice_count=total, file_id=voices[0]["file_id"],
+                                       duration=sum(v.get("duration", 0) for v in voices))
+
 
 @router.message(F.voice)
 async def handle_voice(msg: Message):
+    chat_id = msg.chat.id
     uid = msg.from_user.id
-    sess = _get_session(uid)
 
-    # Decision 8: abandon pending feedback on new voice
+    # If we're in feedback/survey flow, new voice abandons it
+    sess = _get_session(uid)
     if sess.get("awaiting_feedback") or sess.get("awaiting_comment") or sess.get("awaiting_consent"):
         _clear_feedback_state(sess)
     sess["awaiting_action"] = False
+    sess["action_done"] = None
+    sess["action_msg_id"] = None
+    sess["action_chat_id"] = None
 
     user = db_ops.upsert_user(uid, msg.from_user.username)
 
@@ -165,41 +264,68 @@ async def handle_voice(msg: Message):
         await msg.reply(messages.TRIAL_EXHAUSTED)
         return
 
-    # Transcribe
-    wait = await msg.reply(messages.PROCESSING)
-    try:
-        file = await msg.bot.get_file(msg.voice.file_id)
-        ogg_bytes = await msg.bot.download_file(file.file_path)
-        text = await transcribe_ogg(ogg_bytes.read())
-    except Exception as exc:
-        await wait.delete()
-        logger.error("Transcription failed: %s", exc)
-        await msg.reply(messages.ALL_FAILED)
+    # Add to debounce buffer
+    if chat_id not in _voice_buffers:
+        _voice_buffers[chat_id] = {"voices": [], "timer": None}
+
+    buf = _voice_buffers[chat_id]
+    is_long = msg.voice.duration and msg.voice.duration > 180
+    buf["voices"].append({"file_id": msg.voice.file_id, "duration": msg.voice.duration, "msg": msg, "is_long": is_long})
+
+    # Warn if batch already large
+    if len(buf["voices"]) >= MAX_BATCH:
+        # Process immediately — already at limit
+        if buf["timer"]:
+            buf["timer"].cancel()
+        await _process_voice_buffer(chat_id, uid, msg.bot)
         return
-    await wait.delete()
 
-    if not text:
-        await msg.reply("Не удалось разобрать речь.")
-        return
+    # Reset timer on each new voice
+    if buf["timer"]:
+        buf["timer"].cancel()
 
-    logger.info("Voice transcribed (user=%s, len=%d)", uid, len(text))
+    loop = asyncio.get_event_loop()
+    buf["timer"] = loop.call_later(
+        DEBOUNCE_SECS,
+        lambda: asyncio.create_task(_process_voice_buffer(chat_id, uid, msg.bot))
+    )
 
-    # Create voice request
-    vr = db_ops.create_voice_request(user["id"], msg.voice.file_id, msg.voice.duration)
+    # Show queue status
+    limit = MAX_BATCH - len(buf["voices"])
+    if len(buf["voices"]) == 1:
+        await msg.reply(f"🎙 Принято первое голосовое. Жду ещё {DEBOUNCE_SECS} сек (можно ещё {limit})...")
+    else:
+        await msg.reply(f"🎙 Принято {len(buf['voices'])} из {MAX_BATCH}. Жду ещё... (осталось {limit})")
 
-    # Store for callback
+
+async def _show_transcript_and_actions(chat_id: int, uid: int, transcript: str, bot,
+                                       ui_notes: str = "", voice_count: int = 1,
+                                       file_id: str = "", duration: int = 0):
+    """Show transcript + action buttons for a single or batch of voices."""
+    user = db_ops.upsert_user(uid, None)
+    vr = db_ops.create_voice_request(user["id"], file_id, duration)
+    db_ops.update_voice_request(vr["id"], transcript=transcript, transcript_length=len(transcript))
+
+    sess = _get_session(uid)
     cid = str(uuid.uuid4())[:8]
-    _voice_transcripts[cid] = {"text": text, "user_id": uid, "vr_id": vr["id"]}
+    _voice_transcripts[cid] = {"text": transcript, "user_id": uid, "vr_id": vr["id"]}
 
     sess["awaiting_action"] = True
     sess["transcript_cid"] = cid
+    sess["action_started_at"] = asyncio.get_event_loop().time()
+    sess["action_done"] = None
 
-    # Show transcript + 2 buttons
+    header = f"🗣 Принято {voice_count} голосовых" if voice_count > 1 else "🗣 Распознано"
+    notes_prefix = "\n\n" if ui_notes else ""
+    text = f"{header}: {transcript}\n\n{messages.ACTION_KEYBOARD}{ui_notes}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=messages.ACTION_TASKS, callback_data="action:tasks"),
         InlineKeyboardButton(text=messages.ACTION_SUMMARY, callback_data="action:summary"),
     ]])
-    await msg.reply(f"🗣 Распознано: {text}\n\n{messages.ACTION_KEYBOARD}", reply_markup=kb)
+    reply = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    sess["action_msg_id"] = reply.message_id
+    sess["action_chat_id"] = chat_id
 
 
 # ---------------------------------------------------------------------------
@@ -211,14 +337,19 @@ async def action_tasks(cb: CallbackQuery):
     uid = cb.from_user.id
     sess = _get_session(uid)
     cid = sess.get("transcript_cid")
-    data = _voice_transcripts.pop(cid, None) if cid else None
+    data = _voice_transcripts.get(cid)  # Don't pop — keep for 60s so the other button works
 
     if not data:
         await cb.answer(messages.ACTION_EXPIRED, show_alert=True)
         return
 
     await cb.answer()
-    await cb.message.edit_reply_markup(reply_markup=None)
+
+    # Check if the other action was already clicked — if so, expire after this
+    was_both_clicked = sess.get("action_done") is not None
+
+    sess["action_done"] = "tasks"
+    sess["action_started_at"] = asyncio.get_event_loop().time()
     sess["awaiting_action"] = False
 
     user = db_ops.upsert_user(uid, cb.from_user.username)
@@ -228,7 +359,7 @@ async def action_tasks(cb: CallbackQuery):
 
     status_msg = await cb.message.reply("🧠 Извлекаю задачи...")
     try:
-        result = await extract_tasks([data["text"]], OR_API_KEY, OR_MODEL)
+        result = await task_extractor_mod.extract_tasks(data["text"], OR_API_KEY, OR_MODEL)
     except Exception as exc:
         await status_msg.delete()
         logger.error("Task extraction failed: %s", exc)
@@ -237,33 +368,90 @@ async def action_tasks(cb: CallbackQuery):
     await status_msg.delete()
 
     vr_id = data["vr_id"]
-    db_ops.update_voice_request(vr_id, action_type="tasks")
+    # Save LLM output for debugging — full result as JSON
+    import json
+    llm_out = json.dumps(result, ensure_ascii=False, default=str)
+    db_ops.update_voice_request(vr_id, action_type="tasks",
+                                task_count=len(result.get("tasks", [])),
+                                llm_output=llm_out)
     db_ops.decrement_trial(user["id"])
 
+    # Build rating keyboard — always shown regardless of result
+    rate_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="1", callback_data="rate:1"),
+        InlineKeyboardButton(text="2", callback_data="rate:2"),
+        InlineKeyboardButton(text="3", callback_data="rate:3"),
+        InlineKeyboardButton(text="4", callback_data="rate:4"),
+        InlineKeyboardButton(text="5", callback_data="rate:5"),
+    ]])
+
     if result.get("marker") == "no_tasks":
-        await cb.message.reply(messages.NO_TASKS)
+        await cb.message.reply(messages.NO_TASKS, reply_markup=rate_kb)
+        sess["awaiting_feedback"] = True
+        sess["voice_request_id"] = vr_id
     elif result.get("marker") == "too_many_tasks":
-        await cb.message.reply(messages.TOO_MANY)
+        await cb.message.reply(messages.TOO_MANY, reply_markup=rate_kb)
+        sess["awaiting_feedback"] = True
+        sess["voice_request_id"] = vr_id
     elif result.get("marker") == "summary":
-        await cb.message.reply(f"📝 {result.get('summary', '')}")
+        # User asked for tasks but LLM found only summary — show it with note
+        summary_text = result.get('summary', '')
+        await cb.message.reply(
+            f"📝 В этом голосовом нет конкретных задач, но вот ключевые мысли:\n\n{summary_text}",
+            reply_markup=rate_kb
+        )
+        sess["awaiting_feedback"] = True
+        sess["voice_request_id"] = vr_id
     elif result.get("tasks"):
         task_text = messages.format_tasks(result["tasks"])
         if result.get("truncated"):
             task_text += messages.TRUNCATED_NOTE
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="1", callback_data="rate:1"),
-            InlineKeyboardButton(text="2", callback_data="rate:2"),
-            InlineKeyboardButton(text="3", callback_data="rate:3"),
-            InlineKeyboardButton(text="4", callback_data="rate:4"),
-            InlineKeyboardButton(text="5", callback_data="rate:5"),
-        ]])
-        await cb.message.reply(task_text, reply_markup=kb)
+        await cb.message.reply(task_text, reply_markup=rate_kb)
         sess["awaiting_feedback"] = True
         sess["voice_request_id"] = vr_id
     else:
-        await cb.message.reply(messages.NO_TASKS)
+        logger.warning("extract_tasks returned unknown format: %s", result.get('error', 'unknown'))
+        await cb.message.reply(messages.NO_TASKS, reply_markup=rate_kb)
+        sess["awaiting_feedback"] = True
+        sess["voice_request_id"] = vr_id
 
-    logger.info("action=tasks: userId=%s, taskCount=%d", uid, len(result.get("tasks", [])))
+    # Keep action buttons available for 60s so user can try the other option
+    # If both were clicked — expire now instead
+    if was_both_clicked:
+        await _remove_action_buttons(sess)
+        asyncio.create_task(_expire_action(cid, sess))
+    else:
+        asyncio.create_task(_expire_action(cid, sess))
+
+    logger.info("action=tasks: userId=%s, taskCount=%d, marker=%s, raw=%r", uid, len(result.get("tasks", [])), result.get("marker"), result.get("tasks", [])[:2] if result.get("tasks") else "none")
+
+
+async def _remove_action_buttons(sess: dict):
+    """Remove action buttons from the transcript message."""
+    msg_id = sess.pop("action_msg_id", None)
+    chat_id = sess.pop("action_chat_id", None)
+    if msg_id and chat_id and _bot_instance:
+        try:
+            from aiogram.exceptions import TelegramBadRequest
+            await _bot_instance.edit_message_reply_markup(
+                chat_id=chat_id, message_id=msg_id, reply_markup=None
+            )
+        except TelegramBadRequest:
+            pass  # already edited or deleted
+
+
+async def _expire_action(cid: str, sess: dict):
+    """Remove action buttons after 60 seconds by editing the message."""
+    await asyncio.sleep(60)
+    try:
+        await _remove_action_buttons(sess)
+    except Exception as exc:
+        logger.error("_expire_action error: %s", exc)
+    finally:
+        _voice_transcripts.pop(cid, None)
+        sess["action_done"] = None
+        sess["transcript_cid"] = None
+        sess["awaiting_action"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +463,19 @@ async def action_summary(cb: CallbackQuery):
     uid = cb.from_user.id
     sess = _get_session(uid)
     cid = sess.get("transcript_cid")
-    data = _voice_transcripts.pop(cid, None) if cid else None
+    data = _voice_transcripts.get(cid)  # Don't pop — keep for 60s
 
     if not data:
         await cb.answer(messages.ACTION_EXPIRED, show_alert=True)
         return
 
     await cb.answer()
-    await cb.message.edit_reply_markup(reply_markup=None)
+
+    # Check if the other action was already clicked
+    was_both_clicked = sess.get("action_done") is not None
+
+    sess["action_done"] = "summary"
+    sess["action_started_at"] = asyncio.get_event_loop().time()
     sess["awaiting_action"] = False
 
     user = db_ops.upsert_user(uid, cb.from_user.username)
@@ -298,11 +491,30 @@ async def action_summary(cb: CallbackQuery):
         await cb.message.reply(messages.GENERIC_ERROR)
         return
 
-    db_ops.update_voice_request(data["vr_id"], action_type="summary", summary_length=len(summary))
+    db_ops.update_voice_request(data["vr_id"], action_type="summary",
+                                summary_length=len(summary),
+                                llm_output=summary)
     db_ops.decrement_trial(user["id"])
 
-    await cb.message.reply(f"📝 Резюме:\n\n{summary}\n\n{messages.SUMMARY_DONE}")
+    rate_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="1", callback_data="rate:1"),
+        InlineKeyboardButton(text="2", callback_data="rate:2"),
+        InlineKeyboardButton(text="3", callback_data="rate:3"),
+        InlineKeyboardButton(text="4", callback_data="rate:4"),
+        InlineKeyboardButton(text="5", callback_data="rate:5"),
+    ]])
+    await cb.message.reply(f"📝 Резюме:\n\n{summary}\n\n{messages.SUMMARY_DONE}", reply_markup=rate_kb)
+    sess["awaiting_feedback"] = True
+    sess["voice_request_id"] = data["vr_id"]
     logger.info("action=summary: userId=%s, len=%d", uid, len(summary))
+
+    # Keep action buttons available for 60s
+    # If both were clicked — expire now instead
+    if was_both_clicked:
+        await _remove_action_buttons(sess)
+        asyncio.create_task(_expire_action(cid, sess))
+    else:
+        asyncio.create_task(_expire_action(cid, sess))
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +527,18 @@ async def handle_rating(cb: CallbackQuery):
     sess = _get_session(uid)
 
     if not sess.get("awaiting_feedback"):
+        logger.warning("Rating expired for uid=%s, session_keys=%s", uid, list(sess.keys()))
         await cb.answer(messages.FB_EXPIRED)
         return
 
     rating = int(cb.data.split(":")[1])
     await cb.answer()
+
+    # Remove rating buttons immediately
+    await cb.message.edit_reply_markup(reply_markup=None)
+
+    # Also remove action buttons from the transcript message
+    await _remove_action_buttons(sess)
 
     if rating == 5:
         db_ops.save_feedback(sess["voice_request_id"], 5, None, 0)
@@ -397,6 +616,7 @@ async def handle_consent(cb: CallbackQuery):
         except Exception as exc:
             logger.error("Failed to save voice audio: %s", exc)
 
+    _remove_action_buttons(sess)
     _clear_feedback_state(sess)
     await cb.message.reply(messages.FB_SAVED)
 
@@ -514,6 +734,8 @@ async def main():
     bot_db.init_db(bot_db_path)
 
     bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global _bot_instance
+    _bot_instance = bot
     dp = Dispatcher()
     dp.include_router(router)
 

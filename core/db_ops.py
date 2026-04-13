@@ -49,7 +49,9 @@ def update_voice_request(vr_id: int, task_count: int | None = None,
                          transcript_length: int | None = None,
                          action_type: str | None = None,
                          summary_length: int | None = None,
-                         audio_path: str | None = None):
+                         audio_path: str | None = None,
+                         transcript: str | None = None,
+                         llm_output: str | None = None):
     sets, vals = [], []
     if task_count is not None:
         sets.append("task_count = ?"); vals.append(task_count)
@@ -61,6 +63,10 @@ def update_voice_request(vr_id: int, task_count: int | None = None,
         sets.append("summary_length = ?"); vals.append(summary_length)
     if audio_path is not None:
         sets.append("audio_path = ?"); vals.append(audio_path)
+    if transcript is not None:
+        sets.append("transcript = ?"); vals.append(transcript)
+    if llm_output is not None:
+        sets.append("llm_output = ?"); vals.append(llm_output)
     if sets:
         vals.append(vr_id)
         get_db().execute(f"UPDATE voice_requests SET {', '.join(sets)} WHERE id = ?", vals)
