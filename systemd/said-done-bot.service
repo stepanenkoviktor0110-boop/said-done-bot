@@ -1,0 +1,17 @@
+[Unit]
+Description=Said-Done Telegram Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=xander_bot
+Group=xander_bot
+WorkingDirectory=/home/xander_bot/botz/said-done-bot
+ExecStart=/home/xander_bot/botz/МаркетБот/.venv/bin/python entrypoints/telegram_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

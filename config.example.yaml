@@ -1,0 +1,11 @@
+owner_id: 536557472
+llm:
+  openrouter:
+    api_key: "YOUR_KEY"
+    model: qwen/qwen-2.5-72b-instruct
+telegram:
+  bot_token: "YOUR_TOKEN"
+whisper:
+  model: small
+  device: cpu
+  compute_type: int8
